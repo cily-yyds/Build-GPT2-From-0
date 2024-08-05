@@ -164,3 +164,75 @@ y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
 这是一种非常简单粗暴的方法，但总会有意想不到的提升效果。‘漂亮数字’就是12，32，64这种可以被2多次整除的数字，我们可以从头查阅代码，找到‘丑陋数字’用相近的漂亮数字替换，比如gpt2代码里的词汇表大小50257就是一个十分‘丑陋’的数字，就可以用50304来替换。
 
 ## GPT-2的进阶优化
+
+1. 超参数，权重归一化，学习率设置
+
+从`GPT-3`的官方文档查找到模型的超参数设置，以及在向后传播后对权重进行归一化，防止开头遇到一批不太好的数据导致模型初始化的损失函数过高，进而导致权重过高影响模型后续的训练。
+```
+lr=3e-4, betas=(0.9, 0.95), eps=1e-8
+norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+```
+GPT2使用了`cosine衰减`，可以使用pytorch内置函数或者自己实现。
+```
+def get_lr(it):
+(1)linear warmup for warmup_iters steps
+if it < warmup_steps:
+return max_lr * (it+1) / warmup_steps
+(2)if it > lr_decay_iters, return min learning rate
+if it > max_steps:
+return min_lr
+(3)in between, use cosine decay down to min learning rate
+decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+assert 0 <= decay_ratio <= 1
+coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+return min_lr + coeff * (max_lr - min_lr)
+```
+2. 权重累积
+
+用时间换空间
+```
+total_batch_size = 524288
+B = 16
+T = 1024
+grad_accum_steps = total_batch_size // (B * T)
+```
+3. DDP
+
+训练一般运行在多个GPU上，`DDP`就会分配不同批次的数据集到各个GPU，协同交流，大大加速训练。
+DDP初始化：
+```
+ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+if ddp:
+# use of DDP atm demands CUDA, we set the device appropriately according to rank
+assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+init_process_group(backend='nccl')
+ddp_rank = int(os.environ['RANK'])
+ddp_local_rank = int(os.environ['LOCAL_RANK'])
+ddp_world_size = int(os.environ['WORLD_SIZE'])
+device = f'cuda:{ddp_local_rank}'
+torch.cuda.set_device(device)
+master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+else:
+# vanilla, non-DDP run
+ddp_rank = 0
+ddp_local_rank = 0
+ddp_world_size = 1
+master_process = True
+# attempt to autodetect device
+device = "cpu"
+if torch.cuda.is_available():
+device = "cuda"
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+device = "mps"
+print(f"using device: {device}")
+```
+4. 训练数据集
+
+GPT-2和3的数据集从未公布过，这里推荐的数据集是[`fineweb`](https://huggingface.co/spaces/HuggingFaceFW/blogpost-fineweb-v1)。
+
+5. 划分数据集，验证损失函数
+
+完成GPT-2的预训练
+
+- [参考](https://www.youtube.com/watch?v=l8pRSuU81PU&t=13698s)
+
